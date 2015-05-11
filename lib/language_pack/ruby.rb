@@ -19,6 +19,7 @@ class LanguagePack::Ruby < LanguagePack::Base
   DEFAULT_RUBY_VERSION = "ruby-2.0.0"
   RBX_BASE_URL         = "http://binaries.rubini.us/heroku"
   NODE_BP_PATH         = "vendor/node/bin"
+  GSL_BASE_URL         = "https://raw.githubusercontent.com/gregory/heroku-gsl-buildpack/"
 
   # detects if this is a valid Ruby app
   # @return [Boolean] true if it's a Ruby app
@@ -42,6 +43,7 @@ class LanguagePack::Ruby < LanguagePack::Base
     @fetchers[:rbx]    = LanguagePack::Fetcher.new(RBX_BASE_URL, @stack)
     @node_installer    = LanguagePack::NodeInstaller.new(@stack)
     @jvm_installer     = LanguagePack::JvmInstaller.new(slug_vendor_jvm, @stack)
+    @fetchers[:gsl]    = LanguagePack::Fetcher.new(GSL_BASE_URL)
   end
 
   def name
@@ -86,6 +88,7 @@ class LanguagePack::Ruby < LanguagePack::Base
       install_jvm
       setup_language_pack_environment
       setup_export
+      install_gsl
       setup_profiled
       allow_git do
         install_bundler_in_app
@@ -123,7 +126,8 @@ private
     [
       "bin",
       bundler_binstubs_path,
-      "#{slug_vendor_base}/bin"
+      "#{slug_vendor_base}/bin",
+      "#{slug_vendor_gsl}/bin"
     ]
   end
 
@@ -287,6 +291,7 @@ SHELL
       set_env_default  "LANG",     "en_US.UTF-8"
       set_env_override "GEM_PATH", "$HOME/#{slug_vendor_base}:$GEM_PATH"
       set_env_override "PATH",     binstubs_relative_paths.map {|path| "$HOME/#{path}" }.join(":") + ":$PATH"
+      set_env_override 'LD_LIBRARY_PATH', "#{slug_vendor_gsl}/lib"
 
       add_to_profiled set_default_web_concurrency if env("SENSIBLE_DEFAULTS")
 
@@ -486,6 +491,21 @@ ERROR
     end
   end
 
+  def slug_vendor_gsl
+    "/app/vendor/gsl"
+  end
+
+  def install_gsl
+    ver = ENV.fetch('GSL_VERSION', "1.16")
+    puts "Installing GSL #{ver}"
+    FileUtils.mkdir_p slug_vendor_gsl
+    Dir.chdir(slug_vendor_gsl) do
+      instrument 'ruby.install_gsl' do
+        @fetchers[:gsl].fetch_untar("gsl-#{ver}/gsl-#{ver}.tar.gz")
+      end
+    end
+  end
+
   # remove `vendor/bundle` that comes from the git repo
   # in case there are native ext.
   # users should be using `bundle pack` instead.
@@ -538,6 +558,9 @@ WARNING
         bundler_output = ""
         bundle_time    = nil
         Dir.mktmpdir("libyaml-") do |tmpdir|
+          gsl_include   = "#{slug_vendor_gsl}/include"
+          gsl_lib       = "#{slug_vendor_gsl}/lib"
+
           libyaml_dir = "#{tmpdir}/#{LIBYAML_PATH}"
           install_libyaml(libyaml_dir)
 
@@ -551,14 +574,14 @@ WARNING
           env_vars       = {
             "BUNDLE_GEMFILE"                => "#{pwd}/Gemfile",
             "BUNDLE_CONFIG"                 => "#{pwd}/.bundle/config",
-            "CPATH"                         => noshellescape("#{yaml_include}:$CPATH"),
-            "CPPATH"                        => noshellescape("#{yaml_include}:$CPPATH"),
-            "LIBRARY_PATH"                  => noshellescape("#{yaml_lib}:$LIBRARY_PATH"),
+            "CPATH"                         => noshellescape("#{gsl_include}:#{yaml_include}:$CPATH"),
+            "CPPATH"                        => noshellescape("#{gsl_include}:#{yaml_include}:$CPPATH"),
+            "LIBRARY_PATH"                  => noshellescape("#{gsl_lib}:#{yaml_lib}:$LIBRARY_PATH"),
             "RUBYOPT"                       => syck_hack,
             "NOKOGIRI_USE_SYSTEM_LIBRARIES" => "true"
+            #BUNDLE_BUILD__RB-GSL: --with-opt-include=/app/vendor/gsl/include/ #--with-opt-lib=/app/vendor/gsl/lib/
           }
           env_vars["BUNDLER_LIB_PATH"] = "#{bundler_path}" if ruby_version.ruby_version == "1.8.7"
-          puts "Running: #{bundle_command}"
           instrument "ruby.bundle_install" do
             bundle_time = Benchmark.realtime do
               bundler_output << pipe("#{bundle_command} --no-clean", out: "2>&1", env: env_vars, user_env: true)
@@ -588,7 +611,6 @@ WARNING
           puts "Bundler Output: #{bundler_output}"
           if bundler_output.match(/An error occurred while installing sqlite3/)
             error_message += <<ERROR
-
 
 Detected sqlite3 gem which is not supported on Heroku.
 https://devcenter.heroku.com/articles/sqlite3
